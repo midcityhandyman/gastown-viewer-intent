@@ -39,6 +39,10 @@ type Server struct {
 	gtAdapter gastown.Adapter
 	mux       *http.ServeMux
 	sse       *SSEBroker
+	// cache absorbs polling bursts on slow bd/gt endpoints. TTL is kept
+	// short (1.5s) so observed staleness stays under the web UI poll
+	// interval (5s). hq-f95 symptom layer; root cause is bd->Dolt no-pool.
+	cache *responseCache
 }
 
 // NewServer creates a new API server.
@@ -49,6 +53,7 @@ func NewServer(config Config, adapter beads.Adapter) *Server {
 		gtAdapter: gastown.NewFSAdapter(config.TownRoot),
 		mux:       http.NewServeMux(),
 		sse:       NewSSEBroker(),
+		cache:     newResponseCache(1500 * time.Millisecond),
 	}
 	s.registerRoutes()
 	return s
@@ -63,28 +68,28 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /api/v1/issues", s.handleListIssues)
 	s.mux.HandleFunc("GET /api/v1/issues/{id}", s.handleGetIssue)
 
-	// Beads - Board
-	s.mux.HandleFunc("GET /api/v1/board", s.handleBoard)
+	// Beads - Board (cached: 1.5s TTL, high-frequency from kanban UI)
+	s.mux.HandleFunc("GET /api/v1/board", s.withCache(s.cache, s.handleBoard))
 
 	// Beads - Graph
 	s.mux.HandleFunc("GET /api/v1/graph", s.handleGraph)
 
-	// SSE Events
+	// SSE Events (NEVER cache; live stream)
 	s.mux.HandleFunc("GET /api/v1/events", s.handleEvents)
 
-	// Gas Town - Town
-	s.mux.HandleFunc("GET /api/v1/town", s.handleTown)
-	s.mux.HandleFunc("GET /api/v1/town/status", s.handleTownStatus)
+	// Gas Town - Town (cached)
+	s.mux.HandleFunc("GET /api/v1/town", s.withCache(s.cache, s.handleTown))
+	s.mux.HandleFunc("GET /api/v1/town/status", s.withCache(s.cache, s.handleTownStatus))
 
 	// Gas Town - Rigs
 	s.mux.HandleFunc("GET /api/v1/town/rigs", s.handleRigs)
 	s.mux.HandleFunc("GET /api/v1/town/rigs/{name}", s.handleRig)
 
-	// Gas Town - Agents
-	s.mux.HandleFunc("GET /api/v1/town/agents", s.handleAgents)
+	// Gas Town - Agents (cached: polled every 5s by web UI)
+	s.mux.HandleFunc("GET /api/v1/town/agents", s.withCache(s.cache, s.handleAgents))
 
-	// Gas Town - Convoys
-	s.mux.HandleFunc("GET /api/v1/town/convoys", s.handleConvoys)
+	// Gas Town - Convoys (cached)
+	s.mux.HandleFunc("GET /api/v1/town/convoys", s.withCache(s.cache, s.handleConvoys))
 	s.mux.HandleFunc("GET /api/v1/town/convoys/{id}", s.handleConvoy)
 
 	// Gas Town - Molecules
